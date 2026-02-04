@@ -24,7 +24,7 @@ WORKDIR /taiga-back
 
 # grab gosu for easy step-down from root
 # https://github.com/tianon/gosu/blob/master/INSTALL.md
-ENV GOSU_VERSION 1.12
+ENV GOSU_VERSION=1.12
 
 RUN set -eux; \
     apt-get update; \
@@ -40,7 +40,7 @@ RUN set -eux; \
        procps \
        wget; \
     # install gosu
-    apt-get install -y --no-install-recommends ca-certificates wget; \
+    apt-get install -y --no-install-recommends ca-certificates gnupg dirmngr wget; \
     dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"; \
     wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
 	wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
