@@ -89,6 +89,8 @@ django-sr==0.0.4
     # via -r requirements.in
 djmail==2.0.0
     # via -r requirements.in
+django-storages
+boto3==1.42.42
 docopt==0.6.2
     # via psd-tools
 easy-thumbnails==2.8.5
