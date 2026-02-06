@@ -30,6 +30,12 @@ from . import validators
 from . import models
 
 
+
+from io import BytesIO
+from django.core.files.base import ContentFile
+from PIL import Image, ImageOps
+
+
 class BaseAttachmentViewSet(HistoryResourceMixin, WatchedResourceMixin,
                             ArchivedByProjectMixin, BlockedByProjectMixin,
                             ModelCrudViewSet):
@@ -51,10 +57,62 @@ class BaseAttachmentViewSet(HistoryResourceMixin, WatchedResourceMixin,
         app_name, model = self.content_type.split(".", 1)
         return get_object_or_404(ContentType, app_label=app_name, model=model)
 
+    def _compress_image_in_place(self, obj, *, quality=50, max_side=1024):
+        """
+        Substitui obj.attached_file por uma versão comprimida (JPEG).
+        - quality: 1..95 (75 é um bom início)
+        - max_side: se definido, redimensiona para caber no maior lado (mantém proporção)
+        """
+        f = obj.attached_file
+        if not f:
+            return
+
+        name = (getattr(f, "name", "") or "").lower()
+        if not name.endswith((".jpg", ".jpeg", ".png")):
+            return  # só comprime esses
+
+        # garante que estamos no início do stream
+        try:
+            f.file.seek(0)
+        except Exception:
+            pass
+
+        try:
+            img = Image.open(f.file)
+            img = ImageOps.exif_transpose(img)  # respeita orientação EXIF
+        except Exception:
+            return  # não era imagem válida / Pillow não abriu
+
+        # opcional: redimensionar (se você quiser reduzir peso drasticamente)
+        if max_side:
+            w, h = img.size
+            m = max(w, h)
+            if m > max_side:
+                scale = max_side / float(m)
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+        # PNG com alpha precisa virar RGB (senão JPEG falha)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
+        out.seek(0)
+
+        # troca o arquivo do attachment por um ContentFile (Django vai salvar no storage)
+        # se quiser manter o nome original, ok; aqui vou trocar extensão para .jpg se era png
+        base = path.splitext(path.basename(obj.attached_file.name))[0]
+        new_name = f"{base}.jpg"
+
+        obj.attached_file = ContentFile(out.read(), name=new_name)
+        obj.size = obj.attached_file.size
+        obj.name = new_name
+
     def pre_save(self, obj):
         if not obj.id:
             obj.content_type = self.get_content_type()
             obj.owner = self.request.user
+            self._compress_image_in_place(obj, quality=75, max_side=None)
             obj.size = obj.attached_file.size
             obj.name = path.basename(obj.attached_file.name)
 
