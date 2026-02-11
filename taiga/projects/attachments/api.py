@@ -112,7 +112,7 @@ class BaseAttachmentViewSet(HistoryResourceMixin, WatchedResourceMixin,
         if not obj.id:
             obj.content_type = self.get_content_type()
             obj.owner = self.request.user
-            self._compress_image_in_place(obj, quality=75, max_side=None)
+            self._compress_image_in_place(obj, quality=70, max_side=1024)
             obj.size = obj.attached_file.size
             obj.name = path.basename(obj.attached_file.name)
 
