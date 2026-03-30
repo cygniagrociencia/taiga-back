@@ -5,8 +5,13 @@
 #
 # Copyright (c) 2021-present Kaleidos INC
 
-import os.path as path
 import mimetypes
+import os
+import os.path as path
+import shutil
+import subprocess
+import tempfile
+
 mimetypes.init()
 
 from django.utils.translation import gettext as _
@@ -39,6 +44,7 @@ from PIL import Image, ImageOps
 class BaseAttachmentViewSet(HistoryResourceMixin, WatchedResourceMixin,
                             ArchivedByProjectMixin, BlockedByProjectMixin,
                             ModelCrudViewSet):
+    VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".ogg")
 
     model = models.Attachment
     serializer_class = serializers.AttachmentSerializer
@@ -108,11 +114,124 @@ class BaseAttachmentViewSet(HistoryResourceMixin, WatchedResourceMixin,
         obj.size = obj.attached_file.size
         obj.name = new_name
 
+    def _is_video_file(self, attached_file):
+        name = (getattr(attached_file, "name", "") or "").lower()
+        if name.endswith(self.VIDEO_EXTENSIONS):
+            return True
+
+        guessed_mime, _ = mimetypes.guess_type(name)
+        return bool(guessed_mime and guessed_mime.startswith("video/"))
+
+    def _compress_video_in_place(
+        self,
+        obj,
+        *,
+        crf=28,
+        preset="medium",
+        max_width=1280,
+        audio_bitrate="96k",
+    ):
+        """
+        Substitui obj.attached_file por uma versão MP4 (H264/AAC) comprimida.
+        Mantém o arquivo original caso não haja ganho de tamanho ou se houver erro.
+        """
+        f = obj.attached_file
+        if not f or not self._is_video_file(f):
+            return
+
+        if not shutil.which("ffmpeg"):
+            return
+
+        source_path = None
+        output_path = None
+        replaced_file = False
+
+        try:
+            try:
+                f.file.seek(0)
+            except Exception:
+                pass
+
+            source_suffix = path.splitext((getattr(f, "name", "") or ""))[1] or ".tmp"
+            with tempfile.NamedTemporaryFile(suffix=source_suffix, delete=False) as source_tmp:
+                source_path = source_tmp.name
+                if hasattr(f, "chunks"):
+                    for chunk in f.chunks():
+                        source_tmp.write(chunk)
+                else:
+                    source_tmp.write(f.read())
+
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as output_tmp:
+                output_path = output_tmp.name
+
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                source_path,
+                "-map_metadata",
+                "0",
+                "-vf",
+                "scale=min(iw\\,{}):-2".format(max_width),
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                str(crf),
+                "-movflags",
+                "+faststart",
+                "-c:a",
+                "aac",
+                "-b:a",
+                audio_bitrate,
+                output_path,
+            ]
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            with open(output_path, "rb") as output_file:
+                compressed_video = output_file.read()
+
+            if not compressed_video:
+                return
+
+            original_size = getattr(f, "size", None)
+            if original_size is not None and len(compressed_video) >= original_size:
+                return
+
+            base = path.splitext(path.basename(obj.attached_file.name))[0]
+            new_name = "{}.mp4".format(base)
+            obj.attached_file = ContentFile(compressed_video, name=new_name)
+            obj.size = obj.attached_file.size
+            obj.name = new_name
+            replaced_file = True
+        except Exception:
+            return
+        finally:
+            for tmp_path in (source_path, output_path):
+                if tmp_path and path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+            if not replaced_file:
+                try:
+                    f.file.seek(0)
+                except Exception:
+                    pass
+
     def pre_save(self, obj):
         if not obj.id:
             obj.content_type = self.get_content_type()
             obj.owner = self.request.user
             self._compress_image_in_place(obj, quality=70, max_side=1024)
+            self._compress_video_in_place(obj)
             obj.size = obj.attached_file.size
             obj.name = path.basename(obj.attached_file.name)
 
