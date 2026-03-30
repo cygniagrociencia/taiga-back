@@ -31,6 +31,7 @@ RUN set -eux; \
     # install system dependencies
     apt-get install -y \
        build-essential \
+       ffmpeg \
        gettext \
        # libpq5 needed in runtime for psycopg2
        libpq5 \
@@ -61,9 +62,9 @@ RUN set -eux; \
     chmod +x docker/entrypoint.sh; \
     chmod +x docker/async_entrypoint.sh; \
     cp docker/config.py settings/config.py; \
-    #  create taiga group and user to use it and give permissions over the code (in entrypoint)
-    groupadd --system taiga --gid=999; \
-    useradd --system --no-create-home --gid taiga --uid=999 --shell=/bin/bash taiga; \
+    # create taiga group/user if they don't exist in the base image
+    getent group taiga >/dev/null || groupadd --system taiga; \
+    id -u taiga >/dev/null 2>&1 || useradd --system --no-create-home --gid taiga --shell=/bin/bash taiga; \
     mkdir -p /taiga-back/media/exports; \
     chown -R taiga:taiga /taiga-back; \
     # remove unneeded files and packages
