@@ -26,6 +26,7 @@ exec gosu taiga gunicorn taiga.wsgi:application \
     --name taiga_api \
     --bind 0.0.0.0:8000 \
     --workers 3 \
+    --timeout 300 \
     --worker-tmp-dir /dev/shm \
     --log-level=info \
     --access-logfile - \
