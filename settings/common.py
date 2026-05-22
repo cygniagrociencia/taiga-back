@@ -291,6 +291,7 @@ TEMPLATES = [
 
 MIDDLEWARE = [
     "taiga.base.middleware.cors.CorsMiddleware",
+    "taiga.base.middleware.require_auth.RequireAuthMiddleware",
     "taiga.events.middleware.SessionIDMiddleware",
 
     # Common middlewares
