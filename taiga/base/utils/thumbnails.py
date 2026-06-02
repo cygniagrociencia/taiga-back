@@ -67,7 +67,7 @@ def get_thumbnail(file_obj, thumbnailer_size):
         relative_name = file_obj.name
 
     source_extension = os.path.splitext(relative_name)[1][1:]
-    if source_extension.lower() not in ('png', 'svg', 'gif', 'bmp', 'jpeg', 'jpg', 'psd'):
+    if source_extension.lower() not in ('png', 'svg', 'gif', 'bmp', 'jpeg', 'jpg', 'psd', 'webp'):
         return None
 
     try:
