@@ -11,6 +11,7 @@ from django.db.models import Q, OuterRef, Subquery
 from django.utils.translation import gettext as _
 
 from taiga.base import filters
+from taiga.base.utils.db import to_tsquery
 
 
 def get_assigned_users_filter(model, value):
@@ -21,6 +22,53 @@ def get_assigned_users_filter(model, value):
     assigned_to_filter = Q(assigned_to__in=value)
 
     return Q(assigned_user_filter | assigned_to_filter)
+
+
+class UserStoryQFilter(filters.FilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        q = request.QUERY_PARAMS.get("q", None)
+        if not q:
+            return queryset
+
+        userstory_table = queryset.model._meta.db_table
+        attachment_model = apps.get_model("attachments", "Attachment")
+        attachment_table = attachment_model._meta.db_table
+        content_type_model = apps.get_model("contenttypes", "ContentType")
+        content_type = content_type_model.objects.get_for_model(queryset.model)
+        tsquery = to_tsquery(q)
+
+        where_clause = """
+            (
+                to_tsvector(
+                    'simple',
+                    coalesce({userstory_table}.subject, '') || ' ' ||
+                    coalesce(array_to_string({userstory_table}.tags, ' '), '') || ' ' ||
+                    coalesce({userstory_table}.ref) || ' ' ||
+                    coalesce({userstory_table}.description, '')
+                ) @@ to_tsquery('simple', %s)
+                OR EXISTS (
+                    SELECT 1
+                    FROM {attachment_table} AS search_attachment
+                    WHERE search_attachment.content_type_id = %s
+                      AND search_attachment.object_id = {userstory_table}.id
+                      AND search_attachment.project_id = {userstory_table}.project_id
+                      AND search_attachment.is_deprecated = FALSE
+                      AND to_tsvector(
+                          'simple',
+                          coalesce(search_attachment.name, '') || ' ' ||
+                          coalesce(search_attachment.description, '')
+                      ) @@ to_tsquery('simple', %s)
+                )
+            )
+        """.format(
+            userstory_table=userstory_table,
+            attachment_table=attachment_table,
+        )
+
+        return queryset.extra(
+            where=[where_clause],
+            params=[tsquery, content_type.pk, tsquery],
+        )
 
 
 class EpicFilter(filters.BaseRelatedFieldsFilter):

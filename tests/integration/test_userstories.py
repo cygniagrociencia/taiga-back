@@ -12,12 +12,14 @@ from datetime import timedelta
 from urllib.parse import quote
 
 from unittest import mock
+from django.contrib.contenttypes.models import ContentType
 from django.urls import reverse
 from django.utils import timezone
 
 from taiga.base.utils import json
 from taiga.permissions.choices import MEMBERS_PERMISSIONS, ANON_PERMISSIONS
 from taiga.projects.occ import OCCResourceMixin
+from taiga.projects.tasks import models as task_models
 from taiga.projects.userstories import services, models
 
 from .. import factories as f
@@ -219,21 +221,227 @@ def test_api_delete_userstory(client):
     assert response.status_code == 204
 
 
-def test_api_filter_by_subject_or_ref(client):
+@pytest.mark.parametrize(
+    "field,value,query",
+    [
+        ("subject", "distinctive card subject", "card subject"),
+        ("description", "distinctive card description", "card description"),
+        ("tags", ["distinctive-card-tag"], "card tag"),
+        ("ref", 424242, "424242"),
+    ],
+)
+def test_api_filter_by_current_card_fields(client, field, value, query):
     user = f.UserFactory.create()
     project = f.ProjectFactory.create(owner=user)
     f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
 
-    f.UserStoryFactory.create(project=project)
-    f.UserStoryFactory.create(project=project, subject="some random subject")
-    url = reverse("userstories-list") + "?q=some subject"
+    userstory = f.UserStoryFactory.create(project=project, status=status, **{field: value})
+    if field == "ref":
+        query = str(userstory.ref)
 
-    client.login(project.owner)
-    response = client.get(url)
-    number_of_stories = len(response.data)
+    f.UserStoryFactory.create(
+        project=project,
+        status=status,
+        subject="unrelated subject",
+        description="unrelated description",
+        tags=["unrelated-tag"],
+        ref=434343,
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": query},
+    )
 
     assert response.status_code == 200
-    assert number_of_stories == 1, number_of_stories
+    assert [item["id"] for item in response.data] == [userstory.id]
+
+
+@pytest.mark.parametrize("attachment_field", ["name", "description"])
+def test_api_filter_by_attachment_metadata(client, attachment_field):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    f.UserStoryFactory.create(project=project, status=status)
+
+    attachment_data = {
+        "project": project,
+        "content_object": userstory,
+        "from_comment": True,
+        attachment_field: "hydraulic maintenance manual",
+    }
+    f.UserStoryAttachmentFactory.create(**attachment_data)
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "maintenance manual"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [userstory.id]
+
+
+def test_api_filter_by_attachment_metadata_ignores_unrelated_and_deprecated_attachments(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    other_userstory = f.UserStoryFactory.create(project=project, status=status)
+    other_project = f.ProjectFactory.create(owner=user)
+
+    f.UserStoryAttachmentFactory.create(
+        project=project,
+        content_object=other_userstory,
+        name="exclusive unrelated attachment term",
+    )
+    f.AttachmentFactory.create(
+        project=project,
+        content_type=ContentType.objects.get_for_model(task_models.Task),
+        object_id=userstory.id,
+        name="exclusive unrelated attachment term",
+    )
+    f.UserStoryAttachmentFactory.create(
+        project=other_project,
+        content_object=userstory,
+        name="exclusive unrelated attachment term",
+    )
+    f.UserStoryAttachmentFactory.create(
+        project=project,
+        content_object=userstory,
+        name="exclusive unrelated attachment term",
+        is_deprecated=True,
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "exclusive unrelated"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [other_userstory.id]
+
+
+def test_api_filter_by_attachment_metadata_does_not_duplicate_userstories(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+
+    for suffix in ("first", "second"):
+        f.UserStoryAttachmentFactory.create(
+            project=project,
+            content_object=userstory,
+            description="duplicate search term {}".format(suffix),
+        )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "duplicate search"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [userstory.id]
+
+
+def test_api_filter_by_attachment_metadata_combines_with_kanban_filters(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    other_project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    active_status = f.UserStoryStatusFactory.create(project=project, is_archived=False)
+    archived_status = f.UserStoryStatusFactory.create(project=project, is_archived=True)
+
+    active_userstory = f.UserStoryFactory.create(project=project, status=active_status)
+    archived_userstory = f.UserStoryFactory.create(project=project, status=archived_status)
+    other_project_userstory = f.UserStoryFactory.create(project=other_project)
+
+    for userstory in (active_userstory, archived_userstory, other_project_userstory):
+        f.UserStoryAttachmentFactory.create(
+            project=userstory.project,
+            content_object=userstory,
+            name="kanban filter attachment",
+        )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {
+            "project": project.id,
+            "status__is_archived": 0,
+            "q": "kanban filter",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [active_userstory.id]
+
+
+@pytest.mark.parametrize(
+    "query,expected_count",
+    [
+        ("hydrau", 1),
+        ("hydraulic AND urgent", 1),
+        ("hydraulic OR missing", 1),
+        ("hydraulic NOT obsolete", 1),
+        ("(hydraulic OR missing) AND urgent", 1),
+        ("hydraulic AND missing", 0),
+    ],
+)
+def test_api_filter_by_attachment_metadata_preserves_query_syntax(client, query, expected_count):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    f.UserStoryAttachmentFactory.create(
+        project=project,
+        content_object=userstory,
+        name="hydraulic urgent manual",
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": query},
+    )
+
+    assert response.status_code == 200
+    assert len(response.data) == expected_count
+
+
+def test_api_filter_by_attachment_metadata_does_not_combine_different_documents(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(
+        project=project,
+        status=status,
+        subject="hydraulic card",
+    )
+    f.UserStoryAttachmentFactory.create(
+        project=project,
+        content_object=userstory,
+        name="urgent manual",
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "hydraulic AND urgent"},
+    )
+
+    assert response.status_code == 200
+    assert response.data == []
 
 
 def test_api_create_in_bulk_with_status(client):
