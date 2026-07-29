@@ -25,17 +25,78 @@ def get_assigned_users_filter(model, value):
 
 
 class UserStoryQFilter(filters.FilterBackend):
+    def _get_task_permission_clause(self, request, userstory_table):
+        if request.user.is_authenticated and request.user.is_superuser:
+            return "TRUE", []
+
+        project_model = apps.get_model("projects", "Project")
+        project_table = project_model._meta.db_table
+
+        if request.user.is_authenticated:
+            membership_model = apps.get_model("projects", "Membership")
+            membership_table = membership_model._meta.db_table
+            role_model = apps.get_model("users", "Role")
+            role_table = role_model._meta.db_table
+
+            permission_clause = """
+                (
+                    EXISTS (
+                        SELECT 1
+                        FROM {membership_table} AS search_task_membership
+                        INNER JOIN {role_table} AS search_task_role
+                            ON search_task_role.id = search_task_membership.role_id
+                        WHERE search_task_membership.user_id = %s
+                          AND search_task_membership.project_id = {userstory_table}.project_id
+                          AND (
+                              search_task_membership.is_admin = TRUE
+                              OR %s = ANY(search_task_role.permissions)
+                          )
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM {project_table} AS search_task_project
+                        WHERE search_task_project.id = {userstory_table}.project_id
+                          AND %s = ANY(search_task_project.public_permissions)
+                    )
+                )
+            """.format(
+                membership_table=membership_table,
+                role_table=role_table,
+                project_table=project_table,
+                userstory_table=userstory_table,
+            )
+            return permission_clause, [request.user.pk, "view_tasks", "view_tasks"]
+
+        permission_clause = """
+            EXISTS (
+                SELECT 1
+                FROM {project_table} AS search_task_project
+                WHERE search_task_project.id = {userstory_table}.project_id
+                  AND %s = ANY(search_task_project.anon_permissions)
+            )
+        """.format(
+            project_table=project_table,
+            userstory_table=userstory_table,
+        )
+        return permission_clause, ["view_tasks"]
+
     def filter_queryset(self, request, queryset, view):
         q = request.QUERY_PARAMS.get("q", None)
         if not q:
             return queryset
 
         userstory_table = queryset.model._meta.db_table
+        task_model = apps.get_model("tasks", "Task")
+        task_table = task_model._meta.db_table
         attachment_model = apps.get_model("attachments", "Attachment")
         attachment_table = attachment_model._meta.db_table
         content_type_model = apps.get_model("contenttypes", "ContentType")
-        content_type = content_type_model.objects.get_for_model(queryset.model)
+        userstory_content_type = content_type_model.objects.get_for_model(queryset.model)
+        task_content_type = content_type_model.objects.get_for_model(task_model)
         tsquery = to_tsquery(q)
+        task_permission_clause, task_permission_params = (
+            self._get_task_permission_clause(request, userstory_table)
+        )
 
         where_clause = """
             (
@@ -59,15 +120,44 @@ class UserStoryQFilter(filters.FilterBackend):
                           coalesce(search_attachment.description, '')
                       ) @@ to_tsquery('simple', %s)
                 )
+                OR EXISTS (
+                    SELECT 1
+                    FROM {task_table} AS search_task
+                    WHERE search_task.user_story_id = {userstory_table}.id
+                      AND search_task.project_id = {userstory_table}.project_id
+                      AND EXISTS (
+                          SELECT 1
+                          FROM {attachment_table} AS search_task_attachment
+                          WHERE search_task_attachment.content_type_id = %s
+                            AND search_task_attachment.object_id = search_task.id
+                            AND search_task_attachment.project_id = search_task.project_id
+                            AND search_task_attachment.is_deprecated = FALSE
+                            AND to_tsvector(
+                                'simple',
+                                coalesce(search_task_attachment.name, '') || ' ' ||
+                                coalesce(search_task_attachment.description, '')
+                            ) @@ to_tsquery('simple', %s)
+                      )
+                      AND {task_permission_clause}
+                )
             )
         """.format(
             userstory_table=userstory_table,
+            task_table=task_table,
             attachment_table=attachment_table,
+            task_permission_clause=task_permission_clause,
         )
 
         return queryset.extra(
             where=[where_clause],
-            params=[tsquery, content_type.pk, tsquery],
+            params=[
+                tsquery,
+                userstory_content_type.pk,
+                tsquery,
+                task_content_type.pk,
+                tsquery,
+                *task_permission_params,
+            ],
         )
 
 

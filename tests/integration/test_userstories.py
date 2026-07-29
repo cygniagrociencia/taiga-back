@@ -18,6 +18,7 @@ from django.utils import timezone
 
 from taiga.base.utils import json
 from taiga.permissions.choices import MEMBERS_PERMISSIONS, ANON_PERMISSIONS
+from taiga.projects.issues import models as issue_models
 from taiga.projects.occ import OCCResourceMixin
 from taiga.projects.tasks import models as task_models
 from taiga.projects.userstories import services, models
@@ -442,6 +443,399 @@ def test_api_filter_by_attachment_metadata_does_not_combine_different_documents(
 
     assert response.status_code == 200
     assert response.data == []
+
+
+@pytest.mark.parametrize("attachment_field", ["name", "description"])
+def test_api_filter_by_task_attachment_metadata(client, attachment_field):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(
+        owner=user,
+        is_private=True,
+        anon_permissions=[],
+        public_permissions=[],
+    )
+    f.MembershipFactory.create(
+        project=project,
+        user=user,
+        role__project=project,
+        role__permissions=["view_us", "view_tasks"],
+    )
+    points = f.PointsFactory.create(project=project)
+    project.default_points = points
+    project.save(update_fields=["default_points"])
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    f.UserStoryFactory.create(project=project, status=status)
+    task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=userstory,
+    )
+
+    attachment_data = {
+        "project": project,
+        "content_object": task,
+        "from_comment": True,
+        attachment_field: "hydraulic task maintenance manual",
+    }
+    f.TaskAttachmentFactory.create(**attachment_data)
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "maintenance manual"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [userstory.id]
+
+
+def test_api_filter_by_task_attachment_metadata_ignores_unrelated_attachments(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    other_project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    other_task_status = f.TaskStatusFactory.create(project=other_project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    matching_userstory = f.UserStoryFactory.create(project=project, status=status)
+    target_task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=userstory,
+    )
+    matching_task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=matching_userstory,
+    )
+    standalone_task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=None,
+    )
+    cross_project_task = f.TaskFactory.create(
+        project=other_project,
+        status=other_task_status,
+        milestone=None,
+        user_story=userstory,
+    )
+    search_term = "exclusive task attachment term"
+
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=matching_task,
+        name=search_term,
+    )
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=target_task,
+        name=search_term,
+        is_deprecated=True,
+    )
+    f.TaskAttachmentFactory.create(
+        project=other_project,
+        content_object=target_task,
+        name=search_term,
+    )
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=standalone_task,
+        name=search_term,
+    )
+    f.TaskAttachmentFactory.create(
+        project=other_project,
+        content_object=cross_project_task,
+        name=search_term,
+    )
+    f.AttachmentFactory.create(
+        project=project,
+        content_type=ContentType.objects.get_for_model(issue_models.Issue),
+        object_id=target_task.id,
+        name=search_term,
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "exclusive task attachment"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [matching_userstory.id]
+
+
+def test_api_filter_by_task_attachment_metadata_does_not_duplicate_userstories(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+
+    for suffix in ("first", "second"):
+        task = f.TaskFactory.create(
+            project=project,
+            status=task_status,
+            milestone=None,
+            user_story=userstory,
+        )
+        f.TaskAttachmentFactory.create(
+            project=project,
+            content_object=task,
+            description="duplicate nested search term {}".format(suffix),
+        )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "duplicate nested search"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [userstory.id]
+
+
+def test_api_filter_by_task_attachment_metadata_combines_with_kanban_filters(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    other_project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    active_status = f.UserStoryStatusFactory.create(project=project, is_archived=False)
+    archived_status = f.UserStoryStatusFactory.create(project=project, is_archived=True)
+    task_status = f.TaskStatusFactory.create(project=project)
+    other_task_status = f.TaskStatusFactory.create(project=other_project)
+
+    active_userstory = f.UserStoryFactory.create(project=project, status=active_status)
+    archived_userstory = f.UserStoryFactory.create(project=project, status=archived_status)
+    other_project_userstory = f.UserStoryFactory.create(project=other_project)
+
+    for userstory, current_task_status in (
+        (active_userstory, task_status),
+        (archived_userstory, task_status),
+        (other_project_userstory, other_task_status),
+    ):
+        task = f.TaskFactory.create(
+            project=userstory.project,
+            status=current_task_status,
+            milestone=None,
+            user_story=userstory,
+        )
+        f.TaskAttachmentFactory.create(
+            project=userstory.project,
+            content_object=task,
+            name="nested kanban filter attachment",
+        )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {
+            "project": project.id,
+            "status__is_archived": 0,
+            "q": "nested kanban filter",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [active_userstory.id]
+
+
+@pytest.mark.parametrize(
+    "query,expected_count",
+    [
+        ("hydrau", 1),
+        ("hydraulic AND urgent", 1),
+        ("hydraulic OR missing", 1),
+        ("hydraulic NOT obsolete", 1),
+        ("(hydraulic OR missing) AND urgent", 1),
+        ("hydraulic AND missing", 0),
+    ],
+)
+def test_api_filter_by_task_attachment_metadata_preserves_query_syntax(
+    client,
+    query,
+    expected_count,
+):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=userstory,
+    )
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=task,
+        name="hydraulic urgent task manual",
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": query},
+    )
+
+    assert response.status_code == 200
+    assert len(response.data) == expected_count
+
+
+def test_api_filter_by_task_attachment_metadata_does_not_combine_documents(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(owner=user)
+    f.MembershipFactory.create(project=project, user=user, is_admin=True)
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    split_attachment_userstory = f.UserStoryFactory.create(
+        project=project,
+        status=status,
+        subject="unrelated card",
+    )
+    split_story_userstory = f.UserStoryFactory.create(
+        project=project,
+        status=status,
+        subject="hydraulic card",
+    )
+
+    for attachment_name in ("hydraulic manual", "urgent checklist"):
+        task = f.TaskFactory.create(
+            project=project,
+            status=task_status,
+            milestone=None,
+            user_story=split_attachment_userstory,
+        )
+        f.TaskAttachmentFactory.create(
+            project=project,
+            content_object=task,
+            name=attachment_name,
+        )
+
+    task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=split_story_userstory,
+        subject="hydraulic task",
+    )
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=task,
+        name="urgent manual",
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "hydraulic AND urgent"},
+    )
+
+    assert response.status_code == 200
+    assert response.data == []
+
+
+def test_api_filter_by_task_attachment_metadata_requires_view_tasks(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(
+        owner=user,
+        is_private=True,
+        anon_permissions=[],
+        public_permissions=[],
+    )
+    f.MembershipFactory.create(
+        project=project,
+        user=user,
+        role__project=project,
+        role__permissions=["view_us"],
+    )
+    points = f.PointsFactory.create(project=project)
+    project.default_points = points
+    project.save(update_fields=["default_points"])
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(
+        project=project,
+        status=status,
+        subject="visible story metadata",
+    )
+    f.UserStoryAttachmentFactory.create(
+        project=project,
+        content_object=userstory,
+        name="visible direct attachment",
+    )
+    task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=userstory,
+    )
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=task,
+        name="restricted nested attachment",
+    )
+
+    client.login(user)
+
+    restricted_response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "restricted nested"},
+    )
+    story_response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "visible story"},
+    )
+    direct_attachment_response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "visible direct"},
+    )
+
+    assert restricted_response.status_code == 200
+    assert restricted_response.data == []
+    assert [item["id"] for item in story_response.data] == [userstory.id]
+    assert [item["id"] for item in direct_attachment_response.data] == [userstory.id]
+
+
+def test_api_filter_by_task_attachment_metadata_uses_public_view_tasks_permission(client):
+    user = f.UserFactory.create()
+    project = f.ProjectFactory.create(
+        is_private=False,
+        anon_permissions=[],
+        public_permissions=["view_us", "view_tasks"],
+    )
+    status = f.UserStoryStatusFactory.create(project=project)
+    task_status = f.TaskStatusFactory.create(project=project)
+    userstory = f.UserStoryFactory.create(project=project, status=status)
+    task = f.TaskFactory.create(
+        project=project,
+        status=task_status,
+        milestone=None,
+        user_story=userstory,
+    )
+    f.TaskAttachmentFactory.create(
+        project=project,
+        content_object=task,
+        name="public nested attachment",
+    )
+
+    client.login(user)
+    response = client.get(
+        reverse("userstories-list"),
+        {"project": project.id, "q": "public nested"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.data] == [userstory.id]
 
 
 def test_api_create_in_bulk_with_status(client):
